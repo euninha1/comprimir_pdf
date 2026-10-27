@@ -10,16 +10,24 @@ Uso:
   (opcional) --referencia "S:\\...\\Comprimido\\arquivo-compressed.pdf"
 
 O original NUNCA é alterado: o resultado vai para data\\saida\\.
+Cada execução fica registrada no banco de auditoria (tabelas execucao e arquivo).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
+import re
+import sys
 import time
 from pathlib import Path
 
 import psutil
 import pymupdf
+from sqlalchemy.orm import Session
+
+import db 
 
 MB = 1024 * 1024
 
@@ -64,8 +72,6 @@ def reduzir_imagens(pdf: bytes, dpi: int, qualidade: int) -> tuple[bytes, int]:
     Devolve o PDF e quantas imagens foram reduzidas.
     """
     with pymupdf.open("pdf", pdf) as doc:
-        # 1) Maior tamanho em que cada imagem aparece impressa (lado maior, em polegadas).
-        #    Usar o MAIOR tamanho garante que nenhuma ocorrência fique abaixo do DPI alvo.
         maior_lado: dict[int, float] = {}
         for pagina in doc:
             for uso in pagina.get_image_info(xrefs=True):
@@ -75,29 +81,25 @@ def reduzir_imagens(pdf: bytes, dpi: int, qualidade: int) -> tuple[bytes, int]:
                 if xref > 0 and lado > maior_lado.get(xref, 0):
                     maior_lado[xref] = lado
 
-        # 2) Reduz cada imagem distinta que está acima do alvo.
         reduzidas = 0
         for xref, lado in maior_lado.items():
             largura = int(doc.xref_get_key(xref, "Width")[1])
             altura = int(doc.xref_get_key(xref, "Height")[1])
-            if (doc.xref_get_key(xref, "ImageMask")[1] == "true"        # máscara 1 bit
+            if (doc.xref_get_key(xref, "ImageMask")[1] == "true"      
                     or doc.xref_get_key(xref, "BitsPerComponent")[1] == "1"
-                    or max(largura, altura) < 16):                        # faixas 1x1 etc.
+                    or max(largura, altura) < 16):                       
                 continue
             dpi_atual = max(largura, altura) / lado
-            if dpi_atual <= dpi * 1.1:                                    # já está no alvo
+            if dpi_atual <= dpi * 1.1:                                  
                 continue
             escala = dpi / dpi_atual
             pix = pymupdf.Pixmap(doc, xref)
             if pix.alpha:
-                pix = pymupdf.Pixmap(pix, 0)                              # JPEG não tem transparência
+                pix = pymupdf.Pixmap(pix, 0)                             
             if pix.n not in (1, 3):
-                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)                  # CMYK etc. -> RGB
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)                 
             menor = pymupdf.Pixmap(pix, max(1, round(pix.width * escala)),
                                    max(1, round(pix.height * escala)), None)
-            # Troca o conteúdo NO PRÓPRIO objeto: todas as páginas que apontam
-            # para ele passam a usar a versão reduzida. A máscara (/SMask), se
-            # houver, é preservada porque não mexemos nessa chave.
             doc.update_stream(xref, menor.tobytes("jpg", jpg_quality=qualidade), compress=False)
             doc.xref_set_key(xref, "Filter", "/DCTDecode")
             doc.xref_set_key(xref, "DecodeParms", "null")
@@ -110,7 +112,30 @@ def reduzir_imagens(pdf: bytes, dpi: int, qualidade: int) -> tuple[bytes, int]:
         return doc.tobytes(garbage=4, deflate=True, use_objstms=1), reduzidas
 
 
-def main() -> None:
+RE_NOME_LOTE = re.compile(r"^(?P<cep_inicio>\d{8})_(?P<cep_fim>\d{8})_(?P<lote>\d+)$")
+
+
+def sha256_arquivo(caminho: Path) -> str:
+    """'Impressão digital' do arquivo, lida em blocos de 1 MB (não carrega tudo na memória)."""
+    h = hashlib.sha256()
+    with open(caminho, "rb") as f:
+        while bloco := f.read(1024 * 1024):
+            h.update(bloco)
+    return h.hexdigest()
+
+
+def metadados(caminho: Path) -> dict:
+    """CDD = nome da pasta; CEPs e lote = nome do arquivo (quando seguir o padrão)."""
+    m = RE_NOME_LOTE.match(caminho.stem)
+    return {
+        "cdd": caminho.parent.name or None,
+        "cep_inicio": m["cep_inicio"] if m else None,
+        "cep_fim": m["cep_fim"] if m else None,
+        "lote": int(m["lote"]) if m else None,
+    }
+
+
+def main() -> int:
     ap = argparse.ArgumentParser(description="Fase 3: comprime um PDF e mede")
     ap.add_argument("arquivo", type=Path)
     ap.add_argument("--receita", type=int, choices=(1, 2), default=1)
@@ -124,39 +149,85 @@ def main() -> None:
     destino = a.saida / f"{a.arquivo.stem}{sufixo}.pdf"
     a.saida.mkdir(parents=True, exist_ok=True)
 
+    # 1) Registra a execução e o arquivo ANTES de processar, com status PROCESSANDO.
+    #    Se o processo cair no meio, o banco mostra o que ficou pela metade.
+    engine = db.conectar()
+    with Session(engine) as s:
+        lote_id = int(os.environ["LOTE_ID"]) if os.environ.get("LOTE_ID") else None  # vem do processar_lote
+        execucao = db.Execucao(lote_id=lote_id, versao_codigo=db.versao_codigo(), receita=a.receita,
+                               dpi=a.dpi if a.receita == 2 else None,
+                               qualidade_jpeg=a.qualidade if a.receita == 2 else None)
+        registro = db.Arquivo(execucao=execucao, nome=a.arquivo.name, **metadados(a.arquivo),
+                              bytes_original=a.arquivo.stat().st_size,
+                              sha256_original=sha256_arquivo(a.arquivo),
+                              bytes_pdf24=a.referencia.stat().st_size if a.referencia else None,
+                              status="PROCESSANDO")
+        s.add(execucao)
+        s.commit()
+        execucao_id, arquivo_id = execucao.id, registro.id
+
     print(f"\nArquivo : {a.arquivo.name} ({a.arquivo.stat().st_size / MB:,.1f} MB)")
     print(f"Receita : {a.receita}" + (f" (DPI {a.dpi}, JPEG q{a.qualidade})" if a.receita == 2 else " (sem perda)"))
     print("Etapas:")
     t0 = t = time.perf_counter()
+    resultado: dict = {}
 
-    pdf = deduplicar(a.arquivo)
-    t = etapa("1. remover cópias e recomprimir (sem perda)", t)
-    if a.receita == 2:
-        pdf, reduzidas = reduzir_imagens(pdf, a.dpi, a.qualidade)
-        t = etapa(f"2. reduzir {reduzidas} imagens para {a.dpi} DPI (JPEG)", t)
+    # 2) Processa. Qualquer erro vira status ERRO no banco, em vez de sumir no terminal.
+    #    Gravação ATÔMICA: grava primeiro num arquivo .tmp e só renomeia para o nome final
+    #    quando estiver completo e conferido. Assim nunca fica um PDF pela metade com nome
+    #    de pronto (se o processo for interrompido, sobra no máximo o .tmp, que é apagado).
+    temporario = destino.with_name(destino.name + ".tmp")
+    try:
+        pdf = deduplicar(a.arquivo)
+        t = etapa("1. remover cópias e recomprimir (sem perda)", t)
+        if a.receita == 2:
+            pdf, reduzidas = reduzir_imagens(pdf, a.dpi, a.qualidade)
+            t = etapa(f"2. reduzir {reduzidas} imagens para {a.dpi} DPI (JPEG)", t)
 
-    destino.write_bytes(pdf)
-    t = etapa("3. gravar resultado", t)
+        temporario.write_bytes(pdf)
 
-    # Conferência mínima (a validação completa é a Fase 4)
-    with pymupdf.open(a.arquivo) as orig, pymupdf.open(destino) as novo:
-        paginas_ok = len(orig) == len(novo)
+        with pymupdf.open(a.arquivo) as orig, pymupdf.open(temporario) as novo:
+            paginas, paginas_ok = len(orig), len(orig) == len(novo)
 
-    original = a.arquivo.stat().st_size
-    final = destino.stat().st_size
-    print("\nResultado:")
-    print(f"  original          : {original / MB:8,.1f} MB")
-    print(f"  comprimido        : {final / MB:8,.1f} MB   (-{100 * (1 - final / original):.1f}%)")
-    if a.referencia:
-        ref = a.referencia.stat().st_size
-        dif = 100 * (final / ref - 1)
-        print(f"  PDF24             : {ref / MB:8,.1f} MB   (nosso é {abs(dif):.1f}% "
-              f"{'MENOR' if dif < 0 else 'maior'})")
-    print(f"  tempo total       : {time.perf_counter() - t0:8,.1f} s")
-    print(f"  pico de memória   : {pico_memoria_mb():8,.0f} MB")
-    print(f"  páginas iguais    : {'sim' if paginas_ok else 'NÃO  <-- verificar!'}")
-    print(f"  salvo em          : {destino}")
+        if paginas_ok:
+            resultado = dict(paginas=paginas, carnes=paginas // 2,
+                             bytes_comprimido=temporario.stat().st_size,
+                             sha256_comprimido=sha256_arquivo(temporario), status="OK")
+            os.replace(temporario, destino)   # "publica": renomear é instantâneo
+            t = etapa("3. gravar resultado", t)
+        else:
+            resultado = dict(paginas=paginas, status="ERRO", mensagem="número de páginas diferente")
+    except Exception as erro:
+        resultado = dict(status="ERRO", mensagem=f"{type(erro).__name__}: {erro}"[:4000])
+        print(f"\nERRO: {resultado['mensagem']}")
+    finally:
+        temporario.unlink(missing_ok=True)   
+
+    resultado.update(tempo_s=round(time.perf_counter() - t0, 1),
+                     pico_memoria_mb=round(pico_memoria_mb(), 0))
+    with Session(engine) as s:
+        registro = s.get(db.Arquivo, arquivo_id)
+        for campo, valor in resultado.items():
+            setattr(registro, campo, valor)
+        s.get(db.Execucao, execucao_id).finalizada_em = db.agora()
+        s.commit()
+
+    if resultado["status"] == "OK":
+        original, final = a.arquivo.stat().st_size, resultado["bytes_comprimido"]
+        print("\nResultado:")
+        print(f"  original          : {original / MB:8,.1f} MB")
+        print(f"  comprimido        : {final / MB:8,.1f} MB   (-{100 * (1 - final / original):.1f}%)")
+        if a.referencia:
+            ref = a.referencia.stat().st_size
+            dif = 100 * (final / ref - 1)
+            print(f"  PDF24             : {ref / MB:8,.1f} MB   (nosso é {abs(dif):.1f}% "
+                  f"{'MENOR' if dif < 0 else 'maior'})")
+        print(f"  tempo total       : {resultado['tempo_s']:8,.1f} s")
+        print(f"  pico de memória   : {resultado['pico_memoria_mb']:8,.0f} MB")
+        print(f"  salvo em          : {destino}")
+    print(f"\nRegistrado no banco: execução {execucao_id}, arquivo {arquivo_id}, status {resultado['status']}")
+    return 0 if resultado["status"] == "OK" else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
