@@ -1,0 +1,39 @@
+# Configuração da ferramenta de compressão dos carnês de IPTU.
+#
+# Como usar: copie este arquivo para "config.toml" (na raiz do projeto) e ajuste.
+# Caminhos do Windows: use ASPAS SIMPLES ('S:\pasta'), assim não é preciso dobrar as barras.
+# Caminhos relativos (ex.: 'data') valem a partir da pasta do projeto.
+#
+
+# SENHAS NÃO VÃO NESTE ARQUIVO. A senha do Oracle vem da variável de ambiente
+# IPTU_BANCO_ORACLE_SENHA (ou é pedida no terminal ao iniciar).
+#
+# Para conferir a configuração em uso:  python scripts\config.py
+
+[banco]
+# sqlite = arquivo local (testes) | oracle = Oracle via python-oracledb | url = outra URL SQLAlchemy
+tipo = 'sqlite'
+sqlite_arquivo = 'data/auditoria.db'   # NUNCA em pasta de rede: o SQLite pode corromper
+oracle_dsn = ''                        # servidor:porta/servico   ex.: 'oracle-hml:1521/HML'
+oracle_usuario = ''                    # ex.: 'IPTU_COMPRESSAO'
+url = ''                               # só para tipo = 'url'   ex.: 'postgresql+psycopg2://usuario@host/banco'
+
+[pastas]
+entrada = 'S:\Modelo_IPTU'             # originais (só leitura; nunca são alterados)
+dados = 'S:\saida_teste_iptu'          # saídas: trabalho\, saida\ (aprovados) e quarentena\
+logs = 'logs'                          # logs de cada lote (local)
+subpasta_pdf24 = 'Comprimido'          # versões do PDF24: ignoradas na entrada, usadas para comparar
+
+[compressao]
+receita = 2                            # 1 = sem perda | 2 = sem perda + imagens reduzidas (decisão: 2)
+dpi = 150                              # resolução das imagens decorativas (decisão: 150)
+qualidade_jpeg = 80                    # 0 a 100 (decisão: 80)
+
+[validacao]
+amostra = 1                            # lê os códigos de barras/QR em 1 a cada N carnês (1 = todos)
+dpi_leitura = 200                      # resolução usada para "fotografar" a página e ler os códigos
+max_parcelas = 12                      # máximo de parcelas aceito no verso de um carnê
+
+[lote]
+paralelo = 3                           # quantos arquivos processados ao mesmo tempo
+aviso_a_cada_s = 60                    # intervalo (s) do aviso "em andamento" na tela

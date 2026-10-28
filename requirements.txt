@@ -1,0 +1,12 @@
+# Dependências da ferramenta de compressão dos carnês de IPTU.
+# Versões validadas no piloto (Windows, Python 3.13). Instalar com:
+#   python -m pip install -r requirements.txt
+
+pymupdf==2.0          # leitura, compressão e renderização dos PDFs (MuPDF)
+SQLAlchemy==2.1.6     # acesso ao banco de auditoria (SQLite / Oracle / outros)
+zxing-cpp==3.1.1      # leitura dos códigos de barras (ITF) e QR Codes na validação
+numpy==2.5.4          # matriz de pixels entregue ao leitor de códigos
+psutil==7.2.2         # medição do pico de memória
+
+# Só para banco Oracle (modo thin: não precisa do Oracle Client instalado):
+oracledb==26.0.1
