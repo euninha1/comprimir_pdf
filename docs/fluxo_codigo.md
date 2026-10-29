@@ -89,4 +89,12 @@ Com o caderno dá para responder a qualquer momento:
 - Quanto espaço economizamos?
 - O que ainda falta fazer?
 
+**Pronto para a gráfica** = arquivo comprimido **e** conferência **APROVADA**.
+
 ---
+
+## Em uma frase
+
+> Um funcionário tira as cópias repetidas e ajusta as imagens de enfeite; outro confere,
+> página por página, se nada de importante mudou e se todos os códigos continuam lendo;
+> e os dois anotam tudo num caderno.

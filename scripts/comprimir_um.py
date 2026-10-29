@@ -2,7 +2,8 @@
 
 Receitas:
   1 = sem perda: remove cópias de objetos (dedup), recomprime e agrupa objetos.
-  2 = receita 1 + reduz imagens acima do limite de DPI e recomprime em JPEG.
+  2 = receita 1 + reduz imagens acima do limite de DPI e recomprime em JPEG
+      (imagens que contêm código de barras ou QR Code são preservadas).
 
 Uso:
   python scripts\\comprimir_um.py "S:\\...\\arquivo.pdf" --receita 1
@@ -23,13 +24,17 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import psutil
 import pymupdf
+import zxingcpp
 from sqlalchemy.orm import Session
 
-import db 
+import config
+import db  # scripts/db.py (Fase 5)
 
 MB = 1024 * 1024
+FORMATOS_PROTEGIDOS = (zxingcpp.BarcodeFormat.ITF, zxingcpp.BarcodeFormat.QRCode)
 
 
 def pico_memoria_mb() -> float:
@@ -62,16 +67,31 @@ def deduplicar(origem: Path) -> bytes:
                            deflate_fonts=True, use_objstms=1)
 
 
-def reduzir_imagens(pdf: bytes, dpi: int, qualidade: int) -> tuple[bytes, int]:
+def tem_codigo(pix: pymupdf.Pixmap) -> bool:
+    """A imagem contém um código de barras (ITF) ou QR Code legível?
+
+    Alguns geradores gravam o código como IMAGEM (e não como vetor). Reduzir essa
+    imagem para 150 DPI em JPEG afina e borra as barras: o software ainda lê,
+    mas leitoras de banco e apps de celular podem não ler. Por isso essas
+    imagens nunca são reduzidas.
+    """
+    cinza = pix if pix.n == 1 else pymupdf.Pixmap(pymupdf.csGRAY, pix)
+    matriz = np.frombuffer(cinza.samples, dtype=np.uint8).reshape(cinza.height, cinza.stride)[:, :cinza.width]
+    return bool(zxingcpp.read_barcodes(matriz, formats=FORMATOS_PROTEGIDOS))
+
+
+def reduzir_imagens(pdf: bytes, dpi: int, qualidade: int) -> tuple[bytes, int, int]:
     """Receita 2 (com perda): reduz cada imagem DISTINTA acima de `dpi` para `dpi`, em JPEG.
 
     Roda DEPOIS da deduplicação: cada imagem é tratada UMA vez e a troca vale
     para todas as páginas que a usam. (Não usamos o rewrite_images do PyMuPDF:
     em teste ele reduziu o mesmo logo várias vezes em cascata, até 4x2 pixels.)
-    Códigos de barras e QR são vetores, então não são afetados.
-    Devolve o PDF e quantas imagens foram reduzidas.
+    Imagens que CONTÊM código de barras ou QR Code são preservadas intactas.
+    Devolve o PDF, quantas imagens foram reduzidas e quantas foram protegidas.
     """
     with pymupdf.open("pdf", pdf) as doc:
+        # 1) Maior tamanho em que cada imagem aparece impressa (lado maior, em polegadas).
+        #    Usar o MAIOR tamanho garante que nenhuma ocorrência fique abaixo do DPI alvo.
         maior_lado: dict[int, float] = {}
         for pagina in doc:
             for uso in pagina.get_image_info(xrefs=True):
@@ -81,25 +101,32 @@ def reduzir_imagens(pdf: bytes, dpi: int, qualidade: int) -> tuple[bytes, int]:
                 if xref > 0 and lado > maior_lado.get(xref, 0):
                     maior_lado[xref] = lado
 
-        reduzidas = 0
+        # 2) Reduz cada imagem distinta que está acima do alvo.
+        reduzidas = protegidas = 0
         for xref, lado in maior_lado.items():
             largura = int(doc.xref_get_key(xref, "Width")[1])
             altura = int(doc.xref_get_key(xref, "Height")[1])
-            if (doc.xref_get_key(xref, "ImageMask")[1] == "true"      
+            if (doc.xref_get_key(xref, "ImageMask")[1] == "true"        # máscara 1 bit
                     or doc.xref_get_key(xref, "BitsPerComponent")[1] == "1"
-                    or max(largura, altura) < 16):                       
+                    or max(largura, altura) < 16):                        # faixas 1x1 etc.
                 continue
             dpi_atual = max(largura, altura) / lado
-            if dpi_atual <= dpi * 1.1:                                  
+            if dpi_atual <= dpi * 1.1:                                    # já está no alvo
                 continue
             escala = dpi / dpi_atual
             pix = pymupdf.Pixmap(doc, xref)
             if pix.alpha:
-                pix = pymupdf.Pixmap(pix, 0)                             
+                pix = pymupdf.Pixmap(pix, 0)                              # JPEG não tem transparência
             if pix.n not in (1, 3):
-                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)                 
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)                  # CMYK etc. -> RGB
+            if tem_codigo(pix):                                           # código em imagem: não mexe
+                protegidas += 1
+                continue
             menor = pymupdf.Pixmap(pix, max(1, round(pix.width * escala)),
                                    max(1, round(pix.height * escala)), None)
+            # Troca o conteúdo NO PRÓPRIO objeto: todas as páginas que apontam
+            # para ele passam a usar a versão reduzida. A máscara (/SMask), se
+            # houver, é preservada porque não mexemos nessa chave.
             doc.update_stream(xref, menor.tobytes("jpg", jpg_quality=qualidade), compress=False)
             doc.xref_set_key(xref, "Filter", "/DCTDecode")
             doc.xref_set_key(xref, "DecodeParms", "null")
@@ -109,9 +136,10 @@ def reduzir_imagens(pdf: bytes, dpi: int, qualidade: int) -> tuple[bytes, int]:
             doc.xref_set_key(xref, "ColorSpace", "/DeviceGray" if menor.n == 1 else "/DeviceRGB")
             doc.xref_set_key(xref, "BitsPerComponent", "8")
             reduzidas += 1
-        return doc.tobytes(garbage=4, deflate=True, use_objstms=1), reduzidas
+        return doc.tobytes(garbage=4, deflate=True, use_objstms=1), reduzidas, protegidas
 
 
+# 49010000_49027415_1 -> CEP inicial, CEP final, número do lote
 RE_NOME_LOTE = re.compile(r"^(?P<cep_inicio>\d{8})_(?P<cep_fim>\d{8})_(?P<lote>\d+)$")
 
 
@@ -138,11 +166,15 @@ def metadados(caminho: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fase 3: comprime um PDF e mede")
     ap.add_argument("arquivo", type=Path)
-    ap.add_argument("--receita", type=int, choices=(1, 2), default=1)
-    ap.add_argument("--dpi", type=int, default=150, help="receita 2: DPI alvo das imagens")
-    ap.add_argument("--qualidade", type=int, default=80, help="receita 2: qualidade JPEG (0-100)")
+    cfg = config.carregar()   # padrões vêm do config.toml; a linha de comando sobrescreve
+    ap.add_argument("--receita", type=int, choices=(1, 2), default=cfg["compressao"]["receita"])
+    ap.add_argument("--dpi", type=int, default=cfg["compressao"]["dpi"],
+                    help="receita 2: DPI alvo das imagens")
+    ap.add_argument("--qualidade", type=int, default=cfg["compressao"]["qualidade_jpeg"],
+                    help="receita 2: qualidade JPEG (0-100)")
     ap.add_argument("--referencia", type=Path, help="arquivo do PDF24 para comparar")
-    ap.add_argument("--saida", type=Path, default=Path("data/saida"))
+    # Uso manual: grava em trabalho\ (NÃO em saida\, que é só para arquivos já validados)
+    ap.add_argument("--saida", type=Path, default=config.caminho(cfg["pastas"]["dados"]) / "trabalho")
     a = ap.parse_args()
 
     sufixo = f"-r1" if a.receita == 1 else f"-r2-{a.dpi}dpi-q{a.qualidade}"
@@ -181,11 +213,14 @@ def main() -> int:
         pdf = deduplicar(a.arquivo)
         t = etapa("1. remover cópias e recomprimir (sem perda)", t)
         if a.receita == 2:
-            pdf, reduzidas = reduzir_imagens(pdf, a.dpi, a.qualidade)
+            pdf, reduzidas, protegidas = reduzir_imagens(pdf, a.dpi, a.qualidade)
             t = etapa(f"2. reduzir {reduzidas} imagens para {a.dpi} DPI (JPEG)", t)
+            if protegidas:
+                print(f"     {protegidas} imagem(ns) com código de barras/QR preservada(s) sem alteração")
 
         temporario.write_bytes(pdf)
 
+        # Conferência mínima (a validação completa é a Fase 4), ainda no temporário
         with pymupdf.open(a.arquivo) as orig, pymupdf.open(temporario) as novo:
             paginas, paginas_ok = len(orig), len(orig) == len(novo)
 
@@ -201,8 +236,9 @@ def main() -> int:
         resultado = dict(status="ERRO", mensagem=f"{type(erro).__name__}: {erro}"[:4000])
         print(f"\nERRO: {resultado['mensagem']}")
     finally:
-        temporario.unlink(missing_ok=True)   
+        temporario.unlink(missing_ok=True)   # vale também para Ctrl+C
 
+    # 3) Atualiza o registro com o resultado (sucesso ou erro) e fecha a execução.
     resultado.update(tempo_s=round(time.perf_counter() - t0, 1),
                      pico_memoria_mb=round(pico_memoria_mb(), 0))
     with Session(engine) as s:

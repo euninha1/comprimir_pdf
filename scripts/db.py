@@ -10,12 +10,11 @@ Granularidade (o que UMA linha representa):
 LGPD: nenhuma tabela guarda dado de contribuinte (nome, endereço, valor, linha
 digitável). Só metadados técnicos e números de página.
 
-Qual banco é usado (variáveis de ambiente, nesta ordem):
-  1. ORACLE_DSN   -> Oracle. Também usa ORACLE_USER e ORACLE_PASSWORD
-                     (se a senha não estiver definida, ela é pedida no terminal).
-                     Formato do DSN: servidor:porta/nome_do_servico
-  2. DATABASE_URL -> qualquer banco suportado pelo SQLAlchemy (ex.: PostgreSQL)
-  3. nenhuma      -> SQLite local em data/auditoria.db
+Qual banco é usado: seção [banco] do config.toml (ver config.exemplo.toml e scripts/config.py).
+  tipo = 'sqlite' -> arquivo local (sqlite_arquivo). Para testes; nunca em pasta de rede.
+  tipo = 'oracle' -> oracle_dsn (servidor:porta/servico) + oracle_usuario; a SENHA vem da
+                     variável de ambiente IPTU_BANCO_ORACLE_SENHA ou é pedida no terminal.
+  tipo = 'url'    -> qualquer URL do SQLAlchemy (ex.: PostgreSQL).
 
 Uso:
   python scripts\\db.py           testa a conexão, cria as tabelas que faltam e faz um teste em memória
@@ -37,7 +36,8 @@ from sqlalchemy import (TIMESTAMP, BigInteger, Boolean, Float, ForeignKey, Ident
 from sqlalchemy.engine import URL, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
-URL_SQLITE_PADRAO = "sqlite:///data/auditoria.db"
+import config
+
 
 # Data e hora COM fuso. No Oracle, DateTime genérico vira DATE, que perde o fuso;
 # TIMESTAMP(timezone=True) vira TIMESTAMP WITH TIME ZONE (Oracle e PostgreSQL).
@@ -66,7 +66,7 @@ class Lote(Base):
     iniciado_em: Mapped[datetime] = mapped_column(DataHora, default=agora)
     finalizado_em: Mapped[datetime | None] = mapped_column(DataHora)
     duracao_s: Mapped[float | None] = mapped_column(Float)
-    status: Mapped[str] = mapped_column(String(20))                
+    status: Mapped[str] = mapped_column(String(20))                # EM_ANDAMENTO | CONCLUIDO | INTERROMPIDO
     pasta: Mapped[str] = mapped_column(String(500))
     maquina: Mapped[str] = mapped_column(String(100), default=socket.gethostname)
     usuario: Mapped[str] = mapped_column(String(100), default=getpass.getuser)
@@ -76,7 +76,7 @@ class Lote(Base):
     prontos: Mapped[int | None] = mapped_column(Integer)
     reprovados: Mapped[int | None] = mapped_column(Integer)
     erros: Mapped[int | None] = mapped_column(Integer)
-    pulados: Mapped[int | None] = mapped_column(Integer)          
+    pulados: Mapped[int | None] = mapped_column(Integer)          # já resolvidos em lotes anteriores
 
     execucoes: Mapped[list[Execucao]] = relationship(back_populates="lote")
 
@@ -85,12 +85,12 @@ class Execucao(Base):
     __tablename__ = "execucao"
 
     id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
-    lote_id: Mapped[int | None] = mapped_column(ForeignKey("lote.id"), index=True)  
+    lote_id: Mapped[int | None] = mapped_column(ForeignKey("lote.id"), index=True)  # NULL = rodou à mão
     iniciada_em: Mapped[datetime] = mapped_column(DataHora, default=agora)
     finalizada_em: Mapped[datetime | None] = mapped_column(DataHora)
     maquina: Mapped[str] = mapped_column(String(100), default=socket.gethostname)
     usuario: Mapped[str] = mapped_column(String(100), default=getpass.getuser)
-    versao_codigo: Mapped[str | None] = mapped_column(String(40))   
+    versao_codigo: Mapped[str | None] = mapped_column(String(40))   # hash do commit do Git
     receita: Mapped[int] = mapped_column(Integer)
     dpi: Mapped[int | None] = mapped_column(Integer)
     qualidade_jpeg: Mapped[int | None] = mapped_column(Integer)
@@ -118,8 +118,8 @@ class Arquivo(Base):
     carnes: Mapped[int | None] = mapped_column(Integer)
     tempo_s: Mapped[float | None] = mapped_column(Float)
     pico_memoria_mb: Mapped[float | None] = mapped_column(Float)
-    status: Mapped[str] = mapped_column(String(20), index=True)      
-    mensagem: Mapped[str | None] = mapped_column(String(4000))      
+    status: Mapped[str] = mapped_column(String(20), index=True)      # OK | ERRO
+    mensagem: Mapped[str | None] = mapped_column(String(4000))      # VARCHAR2 (não CLOB): consultas simples
     processado_em: Mapped[datetime] = mapped_column(DataHora, default=agora)
 
     execucao: Mapped[Execucao] = relationship(back_populates="arquivos")
@@ -132,7 +132,7 @@ class Validacao(Base):
     id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
     arquivo_id: Mapped[int] = mapped_column(ForeignKey("arquivo.id"), index=True)
     validada_em: Mapped[datetime] = mapped_column(DataHora, default=agora)
-    amostra: Mapped[int] = mapped_column(Integer)                 
+    amostra: Mapped[int] = mapped_column(Integer)                  # 1 = todos os carnês
     dpi: Mapped[int] = mapped_column(Integer)
     paginas: Mapped[int] = mapped_column(Integer)
     linhas_digitaveis: Mapped[int] = mapped_column(Integer)
@@ -152,38 +152,62 @@ class Problema(Base):
     validacao_id: Mapped[int] = mapped_column(ForeignKey("validacao.id"), index=True)
     pagina: Mapped[int | None] = mapped_column(Integer)
     carne: Mapped[int | None] = mapped_column(Integer)
-    lado: Mapped[str | None] = mapped_column(String(10))            
-    tipo: Mapped[str] = mapped_column(String(30))                   
+    lado: Mapped[str | None] = mapped_column(String(10))            # frente | verso
+    tipo: Mapped[str] = mapped_column(String(30))                    # TEXTO, LINHA_DIGITAVEL, ...
     descricao: Mapped[str] = mapped_column(String(1000))
 
     validacao: Mapped[Validacao] = relationship(back_populates="problemas")
 
 
-def _engine_oracle() -> Engine:
+def _engine_oracle(banco: dict) -> Engine:
     """Oracle via python-oracledb (modo thin: não precisa instalar o Oracle Client)."""
-    usuario = os.environ.get("ORACLE_USER") or input("Usuário Oracle: ")
-    senha = os.environ.get("ORACLE_PASSWORD") or getpass.getpass(f"Senha Oracle de {usuario}: ")
+    if not banco["oracle_dsn"]:
+        sys.exit("ERRO: banco.tipo = 'oracle', mas banco.oracle_dsn está vazio no config.toml")
+    usuario = banco["oracle_usuario"] or input("Usuário Oracle: ")
+    senha = os.environ.get("IPTU_BANCO_ORACLE_SENHA") or getpass.getpass(f"Senha Oracle de {usuario}: ")
     url = URL.create("oracle+oracledb", username=usuario, password=senha)
-    return create_engine(url, connect_args={"dsn": os.environ["ORACLE_DSN"]}, pool_pre_ping=True)
+    return create_engine(url, connect_args={"dsn": banco["oracle_dsn"]}, pool_pre_ping=True)
+
+
+def _engine_url(url: str) -> Engine:
+    """SQLite ou qualquer URL do SQLAlchemy."""
+    if url.startswith("sqlite:///"):
+        Path(url.removeprefix("sqlite:///")).parent.mkdir(parents=True, exist_ok=True)
+    # pre_ping: bancos derrubam conexões ociosas.
+    # SQLite: timeout=60 faz quem chega enquanto outro processo grava ESPERAR a vez
+    # (em vez de dar "database is locked") - importante no lote em paralelo.
+    engine = create_engine(url, pool_pre_ping=True,
+                           connect_args={"timeout": 60} if url.startswith("sqlite") else {})
+    if url.startswith("sqlite:///"):
+        @event.listens_for(engine, "connect")
+        def _modo_wal(conexao_dbapi, _):
+            # WAL: leituras não bloqueiam gravações e vice-versa (vários processos ao mesmo tempo)
+            conexao_dbapi.execute("PRAGMA journal_mode=WAL")
+    return engine
 
 
 def conectar(url: str | None = None, criar_tabelas: bool = True) -> Engine:
-    """Abre o banco escolhido pelas variáveis de ambiente e cria as tabelas que faltarem."""
-    if url is None and os.environ.get("ORACLE_DSN"):
-        engine = _engine_oracle()
+    """Abre o banco definido na seção [banco] da configuração e cria as tabelas que faltarem.
+
+    `url` só é usado em testes (ex.: "sqlite://" = banco temporário em memória).
+    """
+    if url is not None:
+        engine = _engine_url(url)
     else:
-        url = url or os.environ.get("DATABASE_URL") or URL_SQLITE_PADRAO
-        if url.startswith("sqlite:///"):
-            Path(url.removeprefix("sqlite:///")).parent.mkdir(parents=True, exist_ok=True)
-    
-        engine = create_engine(url, pool_pre_ping=True,
-                               connect_args={"timeout": 60} if url.startswith("sqlite") else {})
-        if url.startswith("sqlite:///"):
-            @event.listens_for(engine, "connect")
-            def _modo_wal(conexao_dbapi, _):
-                conexao_dbapi.execute("PRAGMA journal_mode=WAL")
+        banco = config.carregar()["banco"]
+        tipo = banco["tipo"].lower()
+        if tipo == "oracle":
+            engine = _engine_oracle(banco)
+        elif tipo == "sqlite":
+            engine = _engine_url(f"sqlite:///{config.caminho(banco['sqlite_arquivo']).as_posix()}")
+        elif tipo == "url":
+            if not banco["url"]:
+                sys.exit("ERRO: banco.tipo = 'url', mas banco.url está vazio no config.toml")
+            engine = _engine_url(banco["url"])
+        else:
+            sys.exit(f"ERRO: banco.tipo = '{banco['tipo']}' inválido (use sqlite, oracle ou url)")
     if criar_tabelas:
-        Base.metadata.create_all(engine)  
+        Base.metadata.create_all(engine)  # só cria o que não existe; não apaga nem altera nada
         migrar(engine)
     return engine
 
@@ -197,6 +221,7 @@ def migrar(engine: Engine) -> None:
     """
     colunas = {c["name"] for c in inspect(engine).get_columns("execucao")}
     if "lote_id" not in colunas:
+        # Oracle: "ADD coluna"; SQLite e PostgreSQL: "ADD COLUMN coluna"
         add = "ADD" if engine.dialect.name == "oracle" else "ADD COLUMN"
         with engine.begin() as conexao:
             conexao.execute(text(f"ALTER TABLE execucao {add} lote_id INTEGER"))
@@ -238,6 +263,7 @@ def _teste() -> None:
         c.execute(text(consulta))
     print(f"Banco real OK ({real.dialect.name}): {real.url.render_as_string(hide_password=True)}")
 
+    # 2) Gravação e leitura num banco TEMPORÁRIO em memória, para não sujar a auditoria.
     engine = conectar("sqlite://")
     with Session(engine) as s:
         ex = Execucao(versao_codigo=versao_codigo(), receita=2, dpi=150, qualidade_jpeg=80)

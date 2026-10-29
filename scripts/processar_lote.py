@@ -51,20 +51,23 @@ import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+import config
 import db
 from comprimir_um import sha256_arquivo
 
 PASTA_SCRIPTS = Path(__file__).resolve().parent
 SCRIPT_COMPRIMIR = PASTA_SCRIPTS / "comprimir_um.py"
 SCRIPT_VALIDAR = PASTA_SCRIPTS / "validar.py"
+# Valores definidos em main() a partir do config.toml (ver scripts/config.py)
 SUBPASTA_PDF24 = "comprimido"          # comparada sem diferenciar maiúsculas
-SUFIXO_SAIDA = "-r2-150dpi-q80.pdf"    # receita decidida na Fase 3
+SUFIXO_SAIDA = "-r2-150dpi-q80.pdf"    # CALCULADO da configuração (receita, dpi, qualidade)
+CFG: dict = {}
 
 PASTA_DADOS = Path("data")   # trocada por --dados; as 3 zonas ficam SEMPRE juntas (mesmo disco)
 ZONAS = ("trabalho", "saida", "quarentena")   # onde um comprimido pode estar
@@ -90,8 +93,8 @@ def listar_pdfs(raiz: Path, ignorar: Path | None = None) -> list[Path]:
     encontrados = []
     for pasta, subpastas, arquivos in os.walk(raiz):
         subpastas[:] = [d for d in subpastas
-                        if d.lower() != SUBPASTA_PDF24                     
-                        and (ignorar is None or (Path(pasta) / d).resolve() != ignorar)]  
+                        if d.lower() != SUBPASTA_PDF24                       # não desce no Comprimido
+                        and (ignorar is None or (Path(pasta) / d).resolve() != ignorar)]  # nem na saída
         encontrados += [Path(pasta) / a for a in arquivos
                         if a.lower().endswith(".pdf") and not a.lower().endswith(SUFIXO_SAIDA)]
     return sorted(encontrados, key=chave_natural)
@@ -126,6 +129,16 @@ def mover_para(comprimido: Path, original: Path, zona: str, motivo: str | None =
     destino.parent.mkdir(parents=True, exist_ok=True)
     if comprimido.resolve() != destino.resolve():
         os.replace(comprimido, destino)            # mesmo disco: instantâneo, conteúdo intacto
+    # Uma única versão por original: se a receita mudou (ex.: DPI 150 -> 200), remove as
+    # versões antigas DESTE original em saida\\ e quarentena\\ (ex.: ..._1-r2-150dpi-q80.pdf).
+    # O padrão "<nome>-r*" não pega outros arquivos: "..._1-r*" não casa com "..._10-r...".
+    for z in ("saida", "quarentena"):
+        pasta = PASTA_DADOS / z / original.parent.name
+        if pasta.is_dir():
+            for antigo in pasta.glob(f"{original.stem}-r*.pdf"):
+                if antigo.resolve() != destino.resolve():
+                    antigo.unlink(missing_ok=True)
+                    antigo.with_suffix(".motivo.txt").unlink(missing_ok=True)
     for z in ZONAS:                                # remove .motivo.txt antigos de outras zonas
         caminho_na_zona(original, z).with_suffix(".motivo.txt").unlink(missing_ok=True)
     if motivo:
@@ -171,6 +184,7 @@ def decidir(sessao: Session, original: Path, forcar: bool) -> tuple[str, str, Pa
         return PROCESSAR, "tinha sido interrompido", None
     if registro.status == "ERRO":
         return PROCESSAR, "nova tentativa após ERRO", None
+    # status OK: o comprimido precisa existir (em alguma zona) e ser exatamente o registrado
     comprimido = localizar_comprimido(original, registro.sha256_comprimido)
     if comprimido is None:
         return PROCESSAR, "comprimido ausente ou alterado", None
@@ -184,7 +198,7 @@ def decidir(sessao: Session, original: Path, forcar: bool) -> tuple[str, str, Pa
 
 def rodar(argumentos: list[str], saida: list[str]) -> int:
     """Roda um script Python num processo separado; guarda a saída em `saida` (vai para o log)."""
-    ambiente = {**os.environ, "PYTHONUTF8": "1"}  
+    ambiente = {**os.environ, "PYTHONUTF8": "1"}  # acentos corretos no Windows
     proc = subprocess.run([sys.executable, *argumentos], capture_output=True, text=True,
                           encoding="utf-8", errors="replace", env=ambiente)
     saida.append(f"\n$ python {' '.join(argumentos)}\n{proc.stdout}{proc.stderr}")
@@ -193,16 +207,53 @@ def rodar(argumentos: list[str], saida: list[str]) -> int:
 
 _TELA = threading.Lock()          # vários arquivos escrevem na tela: um de cada vez
 _EM_ANDAMENTO = [0]               # quantos arquivos estão sendo processados agora
+_INICIOS: dict[Path, float] = {}  # arquivo -> quando começou (para a estimativa do "faltam")
+DIAS = ("seg", "ter", "qua", "qui", "sex", "sáb", "dom")
 
 
-def avisar(mensagem: str) -> None:
-    """Mostra uma linha na tela com o horário (HH:MM:SS)."""
+def avisar(mensagem: str, destaque: bool = False) -> None:
+    """Mostra uma linha na tela com o horário (HH:MM); `destaque` = separada por linha em branco."""
     with _TELA:
-        print(f"{datetime.now():%H:%M:%S}  {mensagem}", flush=True)
+        print(f"{chr(10) if destaque else ''}  {datetime.now():%H:%M}  {mensagem}", flush=True)
+
+
+def cdd_curto(original: Path) -> str:
+    """'CDD_Aracaju_Zona_Sul_49030000_a_49049999' -> 'Aracaju_Zona_Sul' (coluna da tela)."""
+    nome = re.sub(r"^CDD_", "", original.parent.name, flags=re.IGNORECASE)
+    return re.sub(r"_\d+_a_\d+$", "", nome)[:22]
+
+
+def linha_arquivo(status: str, original: Path, resto: str) -> str:
+    return f"{status:<10} {cdd_curto(original):<22} {original.name}   {resto}"
 
 
 def nome_curto(original: Path) -> str:
     return f"{original.parent.name}\\{original.name}"
+
+
+def mb(n_bytes: float) -> str:
+    """1174405120 -> '1.120 MB'; 21390950 -> '20,4 MB' (padrão brasileiro)."""
+    valor = n_bytes / 1024**2
+    texto = f"{valor:,.0f}" if valor >= 100 else f"{valor:,.1f}"
+    return texto.replace(",", "X").replace(".", ",").replace("X", ".") + " MB"
+
+
+def resumo_problema(engine, original: Path, texto: str, situacao: str) -> str:
+    """Uma linha explicando um REPROVADO (1º problema da validação) ou um ERRO (última linha da saída)."""
+    if situacao == "REPROVADO":
+        with Session(engine) as s:
+            registro = ultimo_registro(s, original)
+            validacao = ultima_validacao(s, registro.id) if registro else None
+            if validacao and validacao.problemas:
+                p = validacao.problemas[0]
+                onde = f" pág {p.pagina}" if p.pagina else ""
+                mais = len(validacao.problemas) - 1
+                return f"{p.tipo}{onde}" + (f" (+{mais} problema(s))" if mais else "")
+    # ERRO: a mensagem do próprio script ("ERRO: ...") ou a última linha do traceback
+    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    candidatas = ([l for l in linhas if l.startswith("ERRO")]
+                  or [l for l in linhas if re.match(r"^\w+(Error|Exception)\b", l)] or linhas[-1:])
+    return (candidatas[-1][:90] if candidatas else "sem detalhes")
 
 
 def processar_um(engine, original: Path, acao: str, comprimido: Path | None,
@@ -216,15 +267,19 @@ def processar_um(engine, original: Path, acao: str, comprimido: Path | None,
     """
     with _TELA:
         _EM_ANDAMENTO[0] += 1
-    avisar(f"INICIO  {nome_curto(original)} ({original.stat().st_size / 1024**2:,.0f} MB"
-           f"{'' if acao == PROCESSAR else ', só validar'})")
+        _INICIOS[original] = time.perf_counter()
+    avisar(linha_arquivo("inicia", original, mb(original.stat().st_size)
+                         + ("" if acao == PROCESSAR else "   (só validar)")))
     inicio = time.perf_counter()
     r = {"compressao_s": 0.0, "validacao_s": 0.0}
     saida: list[str] = []
     try:
+        # 1) Compressão (se precisar), sempre na zona de trabalho
         if acao == PROCESSAR:
             comprimido = caminho_na_zona(original, "trabalho")
-            args = [str(SCRIPT_COMPRIMIR), str(original), "--receita", "2",
+            c = CFG["compressao"]
+            args = [str(SCRIPT_COMPRIMIR), str(original), "--receita", str(c["receita"]),
+                    "--dpi", str(c["dpi"]), "--qualidade", str(c["qualidade_jpeg"]),
                     "--saida", str(comprimido.parent)]
             ref = referencia_pdf24(original)
             if ref:
@@ -235,13 +290,16 @@ def processar_um(engine, original: Path, acao: str, comprimido: Path | None,
             if codigo != 0:
                 r["situacao"] = "ERRO"
                 return r
+        # 2) Validação. Código de saída do validar.py: 0 = aprovado, 1 = reprovado,
+        #    outro = a validação NÃO conseguiu rodar (isso é ERRO, não reprovação).
         t = time.perf_counter()
         codigo = rodar([str(SCRIPT_VALIDAR), str(original), str(comprimido),
                         "--amostra", str(amostra)], saida)
         r["validacao_s"] = time.perf_counter() - t
         r["situacao"] = {0: "PRONTO", 1: "REPROVADO"}.get(codigo, "ERRO")
+        # 3) Publica: aprovado vai para a saída; o resto vai para a quarentena
         if r["situacao"] == "PRONTO":
-            mover_para(comprimido, original, "saida")
+            r["bytes_final"] = mover_para(comprimido, original, "saida").stat().st_size
         else:
             with Session(engine) as s:
                 mover_para(comprimido, original, "quarentena", motivo_da_quarentena(s, original))
@@ -251,6 +309,46 @@ def processar_um(engine, original: Path, acao: str, comprimido: Path | None,
         r["total_s"] = time.perf_counter() - inicio
         with _TELA:
             _EM_ANDAMENTO[0] -= 1
+            _INICIOS.pop(original, None)
+
+
+def estimar_faltam(pendentes_mb: dict[Path, float], concluidos: list[tuple[float, float]],
+                   paralelo: int) -> float | None:
+    """Segundos que faltam, considerando TAMANHO e PARALELISMO.
+
+    ritmo  = segundos por MB, medido nos arquivos já concluídos
+    falta  = (MB dos que ainda nem começaram) * ritmo
+           + (o que falta dos que estão em andamento: tamanho * ritmo - tempo já gasto)
+    Se ainda há fila, os 'paralelo' processos dividem o trabalho; se não há mais fila,
+    o lote termina quando o mais demorado dos que estão rodando terminar.
+    """
+    if not concluidos:
+        return None
+    ritmo = sum(s for s, _ in concluidos) / max(sum(mb for _, mb in concluidos), 0.001)
+    agora = time.perf_counter()
+    with _TELA:
+        rodando = {arq: agora - ini for arq, ini in _INICIOS.items()}
+    falta_rodando = [max(0.0, pendentes_mb[a] * ritmo - gasto) for a, gasto in rodando.items()
+                     if a in pendentes_mb]
+    falta_fila = sum(mb * ritmo for a, mb in pendentes_mb.items() if a not in rodando)
+    if falta_fila == 0:
+        return max(falta_rodando, default=0.0)
+    return (falta_fila + sum(falta_rodando)) / paralelo
+
+
+def texto_faltam(segundos: float | None) -> str:
+    """'faltam ~46 h | término ~sáb 09:00' (vazio antes do 1º arquivo terminar)."""
+    if segundos is None:
+        return ""
+    if segundos < 90:
+        duracao = f"{segundos:,.0f} s"
+    elif segundos < 90 * 60:
+        duracao = f"{segundos / 60:,.0f} min"
+    else:
+        duracao = f"{segundos / 3600:,.1f} h".replace(".", ",")
+    fim = datetime.now() + timedelta(seconds=segundos)
+    dia = "hoje" if fim.date() == datetime.now().date() else DIAS[fim.weekday()]
+    return f" | faltam ~{duracao} | término ~{dia} {fim:%H:%M}"
 
 
 def pasta_gravavel(pasta: Path) -> bool:
@@ -272,7 +370,7 @@ def travar() -> Path | None:
     trava = PASTA_DADOS / "lote.lock"
     PASTA_DADOS.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(trava, os.O_CREAT | os.O_EXCL | os.O_WRONLY)   
+        fd = os.open(trava, os.O_CREAT | os.O_EXCL | os.O_WRONLY)   # falha se já existir
     except FileExistsError:
         print(f"\nERRO: já existe um lote rodando ({trava}):\n  "
               f"{trava.read_text(encoding='utf-8', errors='replace')}\n"
@@ -287,25 +385,37 @@ def travar() -> Path | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fase 6: processa uma pasta inteira")
-    ap.add_argument("pasta", type=Path, help="pasta raiz (ex.: S:\\Modelo_IPTU) ou de um CDD")
-    ap.add_argument("--dados", type=Path, default=Path("data"),
-                    help="onde ficam trabalho, saida e quarentena (ex.: S:\\Modelo_IPTU_Comprimido)")
-    ap.add_argument("--paralelo", type=int, default=3, help="quantos arquivos ao mesmo tempo (padrão 3)")
-    ap.add_argument("--amostra", type=int, default=1, help="validação: 1 a cada N carnês")
+    global PASTA_DADOS, SUBPASTA_PDF24, SUFIXO_SAIDA, CFG
+    CFG = config.carregar()   # padrões vêm do config.toml; a linha de comando sobrescreve
+    ap.add_argument("pasta", type=Path, nargs="?",
+                    default=Path(CFG["pastas"]["entrada"]) if CFG["pastas"]["entrada"] else None,
+                    help="pasta raiz ou de um CDD (padrão: pastas.entrada do config.toml)")
+    ap.add_argument("--dados", type=Path, default=config.caminho(CFG["pastas"]["dados"]),
+                    help="onde ficam trabalho, saida e quarentena (padrão: pastas.dados do config.toml)")
+    ap.add_argument("--paralelo", type=int, default=CFG["lote"]["paralelo"],
+                    help="quantos arquivos ao mesmo tempo (padrão: lote.paralelo do config.toml)")
+    ap.add_argument("--amostra", type=int, default=CFG["validacao"]["amostra"],
+                    help="validação: 1 a cada N carnês (padrão: validacao.amostra do config.toml)")
     ap.add_argument("--limite", type=int, help="processar só os N primeiros arquivos (teste)")
     ap.add_argument("--listar", action="store_true", help="só mostra o que seria feito, não processa")
     ap.add_argument("--forcar", action="store_true", help="ignora o banco e processa tudo de novo")
     a = ap.parse_args()
-    global PASTA_DADOS
+    if a.pasta is None:
+        ap.error("informe a pasta de entrada ou preencha pastas.entrada no config.toml")
     PASTA_DADOS = a.dados
+    SUBPASTA_PDF24 = CFG["pastas"]["subpasta_pdf24"].lower()
+    SUFIXO_SAIDA = config.sufixo_saida(CFG)
 
+    # Confere ANTES de começar se os scripts existem com o nome certo
     faltando = [s.name for s in (SCRIPT_COMPRIMIR, SCRIPT_VALIDAR) if not s.exists()]
     if faltando:
         print(f"ERRO: não encontrei {', '.join(faltando)} em {PASTA_SCRIPTS}. "
               "Os scripts precisam ter exatamente esses nomes.")
         return 2
-    if os.environ.get("ORACLE_DSN") and not os.environ.get("ORACLE_PASSWORD"):
-        os.environ["ORACLE_PASSWORD"] = getpass.getpass(f"Senha Oracle de {os.environ.get('ORACLE_USER')}: ")
+    # Oracle: pede a senha UMA vez aqui; os processos filhos herdam pela variável de ambiente
+    if CFG["banco"]["tipo"].lower() == "oracle" and not os.environ.get("IPTU_BANCO_ORACLE_SENHA"):
+        os.environ["IPTU_BANCO_ORACLE_SENHA"] = getpass.getpass(
+            f"Senha Oracle de {CFG['banco']['oracle_usuario']}: ")
 
     pdfs = listar_pdfs(a.pasta, ignorar=PASTA_DADOS)[: a.limite]
     print(f"\nPasta   : {a.pasta}")
@@ -330,6 +440,7 @@ def main() -> int:
     trava = travar()
     if trava is None:
         return 2
+    # Registra o LOTE no banco; os processos filhos recebem o id pela variável LOTE_ID
     with Session(engine) as s:
         lote = db.Lote(status="EM_ANDAMENTO", pasta=str(a.pasta), paralelo=a.paralelo,
                        amostra=a.amostra, arquivos_a_fazer=a_fazer)
@@ -339,11 +450,12 @@ def main() -> int:
     os.environ["LOTE_ID"] = str(lote_id)
     contagem = {"PRONTO": 0, "REPROVADO": 0, "ERRO": 0, "JA_PRONTO": 0, "JA_REPROVADO": 0}
     inicio = time.perf_counter()
-    codigo = 130                      
+    codigo = 130                       # se algo inesperado acontecer, fica como INTERROMPIDO
     try:
         codigo = executar(engine, planos, a_fazer, a, contagem, lote_id)
         return codigo
     finally:
+        # Tempo do LOTE: relógio de início ao fim (com paralelismo, menor que a soma dos arquivos)
         with Session(engine) as s:
             lote = s.get(db.Lote, lote_id)
             lote.finalizado_em = db.agora()
@@ -357,15 +469,16 @@ def main() -> int:
 
 
 def executar(engine, planos, a_fazer: int, a, contagem: dict, lote_id: int) -> int:
-    Path("logs").mkdir(exist_ok=True)
-    caminho_log = Path("logs") / f"lote_{datetime.now():%Y%m%d_%H%M%S}.log"
-    print(f"Lote    : {lote_id} (registrado no banco)")
-    print(f"Saídas  : {PASTA_DADOS.resolve()}")
-    print(f"Log     : {caminho_log}")
-    print(f"Paralelo: {a.paralelo} arquivo(s) ao mesmo tempo, dos maiores para os menores\n")
+    pasta_logs = config.caminho(CFG["pastas"]["logs"])
+    pasta_logs.mkdir(parents=True, exist_ok=True)
+    caminho_log = pasta_logs / f"lote_{datetime.now():%Y%m%d_%H%M%S}.log"
+    cabecalho = (f"LOTE {lote_id}  |  {a_fazer} arquivo(s)  |  {a.paralelo} em paralelo  |  "
+                 f"saídas: {PASTA_DADOS.resolve()}")
+    print(f"\n{cabecalho}\nLog com os detalhes: {caminho_log}\n{'=' * min(len(cabecalho), 100)}")
     inicio, feitos = time.perf_counter(), 0
-    trava_log = threading.Lock()   
-    
+    trava_log = threading.Lock()   # vários arquivos terminam ao mesmo tempo: um escreve por vez
+
+    # 1) Os já resolvidos: rápidos, um por vez (só confere a pasta certa)
     for original, acao, motivo, comprimido in planos:
         if acao == PULAR_PRONTO:
             mover_para(comprimido, original, "saida")
@@ -378,7 +491,7 @@ def executar(engine, planos, a_fazer: int, a, contagem: dict, lote_id: int) -> i
         print(f"Pulados : {contagem['JA_PRONTO']} já PRONTO(s), "
               f"{contagem['JA_REPROVADO']} já REPROVADO(s)\n")
 
-    
+    # 2) Os que precisam de trabalho: em paralelo, maiores primeiro (LPT)
     pendentes = sorted((p for p in planos if p[1] in (PROCESSAR, SO_VALIDAR)),
                        key=lambda p: p[0].stat().st_size, reverse=True)
     with open(caminho_log, "w", encoding="utf-8") as log, \
@@ -386,19 +499,26 @@ def executar(engine, planos, a_fazer: int, a, contagem: dict, lote_id: int) -> i
         tarefas = {executor.submit(processar_um, engine, original, acao, comprimido, a.amostra): original
                    for original, acao, motivo, comprimido in pendentes}
         abertas = set(tarefas)
+        pendentes_mb = {original: original.stat().st_size / 1024**2 for original in tarefas.values()}
+        concluidos: list[tuple[float, float]] = []   # (segundos, MB) de cada arquivo terminado
         try:
             while abertas:
-                
-                prontas, abertas = wait(abertas, timeout=60, return_when=FIRST_COMPLETED)
+                # espera até aviso_a_cada_s; se nada terminar, mostra QUAIS arquivos estão
+                # em processamento e há quanto tempo (assim dá para ver se algum travou)
+                prontas, abertas = wait(abertas, timeout=CFG["lote"]["aviso_a_cada_s"],
+                                        return_when=FIRST_COMPLETED)
                 if not prontas:
-                    avisar(f"...     em andamento: {_EM_ANDAMENTO[0]} arquivo(s) | concluídos "
-                           f"{feitos}/{a_fazer} | decorrido {(time.perf_counter() - inicio) / 60:,.0f} min")
+                    agora = time.perf_counter()
+                    with _TELA:
+                        rodando = sorted(_INICIOS.items(), key=lambda item: item[1])
+                    lista = ", ".join(f"{arq.stem} ({(agora - ini) / 60:,.0f} min)" for arq, ini in rodando)
+                    avisar(f"... processando: {lista}", destaque=True)
                     continue
                 for tarefa in prontas:
                     original = tarefas[tarefa]
                     try:
                         r = tarefa.result()
-                    except Exception as erro:         
+                    except Exception as erro:          # falha no próprio lote (ex.: mover arquivo)
                         r = {"situacao": "ERRO", "compressao_s": 0, "validacao_s": 0, "total_s": 0,
                              "texto": f"\nfalha no lote: {type(erro).__name__}: {erro}\n"}
                     with trava_log:
@@ -408,11 +528,25 @@ def executar(engine, planos, a_fazer: int, a, contagem: dict, lote_id: int) -> i
                         log.flush()
                     contagem[r["situacao"]] += 1
                     feitos += 1
-                    restante = (time.perf_counter() - inicio) / feitos * (a_fazer - feitos)
-                    avisar(f"FIM     [{feitos}/{a_fazer}] {nome_curto(original)}  {r['situacao']}\n"
-                           f"          compressão {r['compressao_s']:,.0f} s + validação "
-                           f"{r['validacao_s']:,.0f} s = {r['total_s']:,.0f} s"
-                           f" | faltam ~{restante / 60:,.0f} min")
+                    concluidos.append((r["total_s"], pendentes_mb.pop(original)))
+                    posicao = f"[{feitos:>{len(str(a_fazer))}}/{a_fazer} {100 * feitos // a_fazer:>3}%]"
+                    tempo = f"{r['total_s'] / 60:,.0f} min" if r["total_s"] >= 90 else f"{r['total_s']:,.0f} s"
+                    if r["situacao"] == "PRONTO":
+                        antes, depois = original.stat().st_size, r["bytes_final"]
+                        detalhe = (f"{mb(antes)} -> {mb(depois)} "
+                                   f"(-{100 * (1 - depois / antes):.0f}%)   {tempo}")
+                        status = "OK"
+                    else:
+                        destino = "-> quarentena" if r["situacao"] == "REPROVADO" else "(ver log)"
+                        detalhe = f"{resumo_problema(engine, original, r['texto'], r['situacao'])} {destino}"
+                        status = r["situacao"]
+                    avisar(linha_arquivo(status, original, f"{detalhe}   {posicao}"))
+                    # a cada 10 arquivos (e no último): o placar e a previsão de término
+                    if feitos % 10 == 0 or feitos == a_fazer:
+                        restante = estimar_faltam(pendentes_mb, concluidos, a.paralelo)
+                        avisar(f">> progresso: {feitos}/{a_fazer} ({100 * feitos // a_fazer}%) | "
+                               f"{contagem['PRONTO']} OK, {contagem['REPROVADO']} reprovado(s), "
+                               f"{contagem['ERRO']} erro(s){texto_faltam(restante) if feitos < a_fazer else ''}", destaque=True)
         except KeyboardInterrupt:
             executor.shutdown(wait=False, cancel_futures=True)
             print("\nInterrompido. O que terminou está registrado; rode o MESMO comando para continuar.")

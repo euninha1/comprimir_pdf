@@ -9,19 +9,29 @@ Usa o mesmo banco do db.py (SQLite local, ou Oracle se ORACLE_DSN estiver defini
 """
 
 from __future__ import annotations
+
 import re
 import sys
 from pathlib import Path
+
 from sqlalchemy import text
+
 import db
 
 ARQUIVO_SQL = Path(__file__).resolve().parent.parent / "sql" / "consultas_auditoria.sql"
 
 
 def carregar_consultas() -> dict[str, tuple[str, str]]:
-    """Lê o .sql e separa as consultas pelo marcador '-- nome:'. Devolve {nome: (descrição, sql)}."""
+    """Lê o .sql e separa as consultas pelo marcador '-- nome:'. Devolve {nome: (descrição, sql)}.
+
+    Tolera variações comuns no Windows: BOM no início (utf-8-sig), quebras de linha CRLF
+    e o marcador reformatado por extensões do editor ('--nome:', '-- nome :', '-- NOME:').
+    """
+    if not ARQUIVO_SQL.exists():
+        sys.exit(f"ERRO: não encontrei o arquivo de consultas em {ARQUIVO_SQL}")
+    conteudo = ARQUIVO_SQL.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
     consultas = {}
-    blocos = re.split(r"^-- nome:\s*", ARQUIVO_SQL.read_text(encoding="utf-8"), flags=re.M)[1:]
+    blocos = re.split(r"^--\s*nome\s*:\s*", conteudo, flags=re.M | re.I)[1:]
     for bloco in blocos:
         nome, resto = bloco.split("\n", 1)
         linhas = resto.strip().splitlines()
@@ -45,6 +55,11 @@ def imprimir_tabela(colunas: list[str], linhas: list[tuple]) -> None:
 
 def main() -> int:
     consultas = carregar_consultas()
+    if not consultas:
+        print(f"ERRO: nenhuma consulta encontrada em {ARQUIVO_SQL}.\n"
+              "Cada consulta precisa começar com uma linha '-- nome: <nome>'. "
+              "Confira se o arquivo foi salvo inteiro (a versão mais recente).")
+        return 1
     if len(sys.argv) < 2:
         print("Consultas disponíveis:")
         for nome, (descricao, _) in consultas.items():

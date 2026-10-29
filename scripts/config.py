@@ -45,10 +45,11 @@ PADROES: dict[str, dict] = {
         "amostra": 1,                        # ler códigos em 1 a cada N carnês (1 = todos)
         "dpi_leitura": 200,                  # resolução da "foto" para ler os códigos
         "max_parcelas": 12,
+        "tolerancia_regiao": 1.0,            # diferença média (0-255) aceita na região de cada código
     },
     "lote": {
         "paralelo": 3,                       # arquivos ao mesmo tempo
-        "aviso_a_cada_s": 60,                # intervalo do aviso "em andamento"
+        "aviso_a_cada_s": 300,               # intervalo do aviso "processando" (segundos)
     },
 }
 

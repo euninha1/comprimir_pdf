@@ -69,7 +69,7 @@ python scripts\consultar.py problemas
 - **Colunas:** `cdd`, `nome`, `etapa` (COMPRESSAO ou VALIDACAO), `pagina`, `lado`
   (frente/verso), `tipo`, `descricao`.
 - **Tipos de problema:** `ERRO` (compressão), `PAGINAS`, `TEXTO`, `LINHA_DIGITAVEL`,
-  `REGRA_CARNE`, `CODIGO_LIDO`, `BARRAS_X_LINHA` (ver `docs/criterios_validacao.md`).
+  `REGRA_CARNE`, `CODIGO_LIDO`, `BARRAS_X_LINHA`, `REGIAO_CODIGO` (ver `docs/criterios_validacao.md`).
 
 ## 5. `reducao_cdd`: quanto economizamos
 

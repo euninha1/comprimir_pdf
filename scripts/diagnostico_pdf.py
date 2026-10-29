@@ -17,7 +17,7 @@ from pathlib import Path
 import pymupdf
 
 MB = 1024 * 1024
-TAMANHOS_PAPEL = {"A4": (595, 842), "A3": (842, 1191)}  
+TAMANHOS_PAPEL = {"A4": (595, 842), "A3": (842, 1191)}  # em pontos (1 pt = 1/72 pol)
 
 
 def nome_papel(largura: float, altura: float) -> str:
@@ -29,22 +29,24 @@ def nome_papel(largura: float, altura: float) -> str:
 
 
 def tamanho_stream(doc: pymupdf.Document, xref: int) -> int:
+    """Bytes gravados do stream (comprimido, como está no disco)."""
     tipo, valor = doc.xref_get_key(xref, "Length")
     if tipo == "int":
         return int(valor)
-    if tipo == "xref": 
+    if tipo == "xref":  # /Length 12 0 R -> o tamanho está em outro objeto
         return int(doc.xref_object(int(valor.split()[0])).strip())
     return 0
 
 
 def espaco_de_cor(doc: pymupdf.Document, xref: int) -> str:
+    """RGB, Gray, CMYK... resolvendo referências indiretas (/ColorSpace 7 0 R)."""
     tipo, valor = doc.xref_get_key(xref, "ColorSpace")
     if tipo == "xref":
         valor = doc.xref_object(int(valor.split()[0]), compressed=True)
     if tipo == "null" and doc.xref_get_key(xref, "ImageMask")[1] == "true":
         return "Mask"
     icc = re.search(r"/ICCBased\s+(\d+)\s+0\s+R", valor)
-    if icc: 
+    if icc:  # perfil ICC: a cor é dada pelo nº de canais (/N) do objeto do perfil
         canais = doc.xref_get_key(int(icc.group(1)), "N")[1]
         return {"1": "Gray", "3": "RGB", "4": "CMYK"}.get(canais, "ICC")
     for nome in ("RGB", "Gray", "CMYK", "Indexed", "Separation", "Lab"):
@@ -69,7 +71,7 @@ def categoria(doc: pymupdf.Document, xref: int) -> str:
 
 
 def main(caminho: Path) -> None:
-    doc = pymupdf.open(caminho)  
+    doc = pymupdf.open(caminho)  # leitura apenas; nunca chamamos save()
     tamanho = caminho.stat().st_size
     pagina = doc[0].rect
 
@@ -80,7 +82,7 @@ def main(caminho: Path) -> None:
           f"= {pagina.width / 72 * 25.4:.0f} x {pagina.height / 72 * 25.4:.0f} mm "
           f"-> {nome_papel(pagina.width, pagina.height)}")
 
-
+    # 1) Onde está o peso: soma dos streams por categoria
     por_categoria: Counter[str] = Counter()
     for xref in range(1, doc.xref_length()):
         if doc.xref_is_stream(xref):
@@ -90,12 +92,12 @@ def main(caminho: Path) -> None:
     for cat, total in por_categoria.most_common():
         print(f"  {cat:<36} {total / MB:>9,.1f} MB  ({100 * total / tamanho:5.1f}%)")
 
-
+    # 2) Imagens: objetos x conteúdos distintos (potencial de deduplicação)
     usos: Counter[int] = Counter()
     for p in doc:
         for img in p.get_images(full=True):
             usos[img[0]] += 1
-    grupos: dict[str, list[int]] = defaultdict(list)  
+    grupos: dict[str, list[int]] = defaultdict(list)  # hash do conteúdo -> xrefs
     for xref in usos:
         grupos[hashlib.md5(doc.xref_stream_raw(xref)).hexdigest()].append(xref)
     bytes_imagens = sum(tamanho_stream(doc, x) for x in usos)
@@ -108,6 +110,7 @@ def main(caminho: Path) -> None:
     print(f"  peso sem cópias repetidas    : {bytes_unicos / MB:,.1f} MB"
           f"  <- alvo da deduplicação (SEM perda de qualidade)")
 
+    # 3) Detalhe das imagens distintas mais pesadas
     print("\n== Imagens distintas mais pesadas ==")
     print(f"  {'cópias':>6} {'KB cada':>8} {'pixels':>11} {'cor':>5} {'bits':>4}  formato")
     print("  (cópias = objetos com conteúdo idêntico; KB = tamanho gravado de UMA cópia)")
@@ -126,7 +129,8 @@ def main(caminho: Path) -> None:
         print(f"  {len(xs):>6} {tamanho_stream(doc, x) / 1024:>8,.0f} {w + 'x' + h:>11} "
               f"{cs:>5} {bpc:>4}  {formato}")
 
-    forms: dict[str, list[int]] = defaultdict(list)   
+    # 5) Form XObjects: blocos de desenho reaproveitáveis ("carimbos")
+    forms: dict[str, list[int]] = defaultdict(list)   # hash do conteúdo -> xrefs
     por_filtro: Counter[str] = Counter()
     for xref in range(1, doc.xref_length()):
         if doc.xref_get_key(xref, "Subtype")[1] == "/Form":
@@ -147,6 +151,7 @@ def main(caminho: Path) -> None:
     for xs in pesados[:5]:
         print(f"    {len(xs):>6} x {tamanho_stream(doc, xs[0]) / 1024:>7,.1f} KB")
 
+    # 4) Resolução efetiva e vetores nas 2 primeiras páginas (1 carnê: frente e verso)
     for numero in range(min(2, len(doc))):
         p = doc[numero]
         print(f"\n== Página {numero + 1} ({'frente' if numero == 0 else 'verso'}) ==")
@@ -154,6 +159,7 @@ def main(caminho: Path) -> None:
             caixa = pymupdf.Rect(im["bbox"])
             if caixa.width <= 0:
                 continue
+            # max/max: a imagem pode estar girada 90° na página
             dpi = max(im["width"], im["height"]) / (max(caixa.width, caixa.height) / 72)
             print(f"  imagem {im['width']}x{im['height']} px em {caixa.width / 72 * 25.4:.0f}x"
                   f"{caixa.height / 72 * 25.4:.0f} mm -> {dpi:,.0f} DPI")

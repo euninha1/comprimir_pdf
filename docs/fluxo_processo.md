@@ -4,7 +4,7 @@
  [0] diagnostico_pdf.py   (só quando o layout do carnê mudar)
           │  entender o PDF antes de mexer
           ▼
- [1] db.py                (FASE SOMENTE NESSE ESCOPO) 
+ [1] db.py                (uma vez: cria o banco de auditoria)
           │
           ▼
  ┌──────────────── para cada PDF de carnês ────────────────┐
@@ -19,7 +19,7 @@
  [4] consultas SQL        (o que está pronto? quanto reduziu? o que falhou?)
           │
           ▼
-        FIM ( depois segue o processo de seguir para gráfica e etc)
+ [5] envio à gráfica      (fora do escopo do projeto: só arquivos APROVADOS)
 ```
 
 ---
@@ -35,7 +35,7 @@
   **vetores** (não são afetados pela compressão). Todas as decisões vieram daqui.
 - **Grava no banco?** Não. É análise.
 
-## [1] db.py: preparar o banco  (fase somente desse escopo - depois vai para o oracle) 
+## [1] db.py: preparar o banco
 
 - **Quando:** uma vez (ou sempre que mudar de banco: SQLite para Oracle).
 - **O que faz:** conecta no banco e cria as 4 tabelas que faltarem
@@ -80,5 +80,16 @@
 - **Por quê:** com ~440 arquivos, ninguém confere no olho. O banco responde em segundos
   e serve de evidência para gestão e auditoria.
 
+## [5] Envio à gráfica (fora do escopo)
+
+- **Regra:** só vai para a gráfica o arquivo com `arquivo.status = 'OK'` **e**
+  `validacao.aprovado = 1`.
 
 ---
+
+## Próxima etapa do projeto (Fase 6)
+
+Hoje os passos [2] e [3] são rodados **à mão, um arquivo por vez**.
+Na Fase 6, um único comando vai fazer [2] + [3] para **todos os PDFs de uma pasta**,
+em paralelo, retomando de onde parou se o PC desligar, e separando em quarentena o
+que der erro.

@@ -61,13 +61,29 @@ Uma única falha em qualquer página reprova o arquivo inteiro (**REPROVADO**).
   duas formas. Se divergirem, quem paga pelas barras e quem digita a linha pagam coisas
   diferentes. Também pega inconsistências que já vieram do sistema gerador.
 
+## Critério 7: região de cada código idêntica ao original (pixel a pixel)
+
+- **O que verifica:** para cada código de barras e QR Code lido no original, recorta-se a
+  mesma região (com a zona de silêncio ao redor) na "foto" do original e na do comprimido.
+  A **diferença média dos pixels** (escala de 0 a 255) tem que ficar dentro da tolerância
+  (`tolerancia_regiao`, padrão **1,0**; 0 = idêntico).
+- **Por quê:** o critério 5 só prova que um **software tolerante** consegue ler. Leitoras de
+  caixa, lotéricas e apps de banco são bem mais exigentes: uma barra afinada ou borrada pelo
+  JPEG ainda é lida pelo zxing, mas pode não ser lida no banco. A compressão **não deve tocar**
+  nos códigos; por isso a exigência é que a região continue praticamente idêntica.
+- **Referência medida:** barra gravada como imagem e reduzida para 150 DPI em JPEG →
+  diferença ≈ **7,2** (lida pelo zxing, mas reprovada aqui). Barra vetorial ou imagem
+  preservada → diferença **0,00**.
+- **Proteção na compressão:** antes de reduzir qualquer imagem, `comprimir_um.py` tenta ler
+  um ITF ou QR Code dentro dela; se encontrar, a imagem é **preservada sem alteração**.
+
 ---
 
 ## O que NÃO é verificado (e por quê)
 
 | Não verificado | Motivo |
 |---|---|
-| Imagens decorativas (brasão, artes, logos dos bancos) | Elas **devem** mudar: é onde a compressão reduz a resolução (150 DPI, JPEG q80). Qualidade conferida visualmente na Fase 3 |
+| Imagens decorativas (brasão, artes, logos dos bancos), fora das regiões dos códigos | Elas **devem** mudar: é onde a compressão reduz a resolução (150 DPI, JPEG q80). Qualidade conferida visualmente na Fase 3 |
 | Posição do texto na página | Fora do escopo atual; melhoria futura |
 | Dígitos verificadores da linha digitável (módulo 10/11) | Uma linha já errada na origem e igual nos dois arquivos passaria; melhoria futura |
 | Conteúdo do QR Code (formato da URL / BR Code PIX) | Só se garante que é igual ao original |
@@ -84,4 +100,3 @@ Lote `49010000_49027415_1.pdf` (1.000 páginas, 500 carnês), receita 2 (150 DPI
 - 3.562 códigos de barras lidos, todos batendo com as linhas digitáveis
 - 500 QR Codes lidos (1 por carnê)
 - **APROVADO**, em cerca de 200 a 250 s
-

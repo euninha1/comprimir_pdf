@@ -6,13 +6,17 @@ Destinado à equipe de arquitetura. Visão geral do projeto: `docs/visao_geral.m
 
 Para cada PDF de carnês (≈ 500 carnês / 1.000 páginas A3 por arquivo):
 
-1. **comprime** (remove imagens repetidas; reduz imagens decorativas para 150 DPI, JPEG q80);
-2. **valida** contra o original (páginas, texto, linhas digitáveis, regra do carnê e
-   leitura por software de todos os códigos de barras ITF e QR Codes);
+1. **comprime** (remove imagens repetidas; reduz imagens decorativas para 150 DPI, JPEG q80;
+   imagens que contêm código de barras ou QR Code **nunca** são reduzidas);
+2. **valida** contra o original (páginas, texto, linhas digitáveis, regra do carnê,
+   leitura por software de todos os códigos de barras ITF e QR Codes e comparação
+   pixel a pixel da região de cada código);
 3. **publica**: aprovado → `saida\`; reprovado ou não validado → `quarentena\` + `.motivo.txt`;
 4. **registra** tudo no banco de auditoria (lote, execução, arquivo, validação, problemas).
 
 O original nunca é alterado. Critérios de validação: `docs/criterios_validacao.md`.
+
+**Fora do escopo:** o envio dos arquivos à gráfica. A ferramenta termina na pasta `saida\`.
 
 ## 2. Requisitos
 
@@ -45,7 +49,7 @@ python -m pip install -r requirements.txt
 | `[banco]` | `tipo`, `sqlite_arquivo`, `oracle_dsn`, `oracle_usuario`, `url` | `tipo = 'oracle'` para produção |
 | `[pastas]` | `entrada`, `dados`, `logs`, `subpasta_pdf24` | `dados` = onde ficam `trabalho\`, `saida\`, `quarentena\` |
 | `[compressao]` | `receita`, `dpi`, `qualidade_jpeg` | Decisão validada: 2 / 150 / 80 |
-| `[validacao]` | `amostra`, `dpi_leitura`, `max_parcelas` | `amostra = 1` valida os códigos de todos os carnês |
+| `[validacao]` | `amostra`, `dpi_leitura`, `max_parcelas`, `tolerancia_regiao` | `amostra = 1` valida os códigos de todos os carnês; `tolerancia_regiao = 1.0` (não aumentar sem teste em leitora real) |
 | `[lote]` | `paralelo`, `aviso_a_cada_s` | `paralelo` limitado por memória e rede |
 
 **Prioridade:** linha de comando > variável de ambiente > `config.toml` > padrão do código.
